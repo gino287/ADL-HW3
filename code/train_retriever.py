@@ -1,263 +1,236 @@
-"""
-This examples show how to train a Bi-Encoder for the MS Marco dataset (https://github.com/microsoft/MSMARCO-Passage-Ranking).
-
-The queries and passages are passed independently to the transformer network to produce fixed sized embeddings.
-These embeddings can then be compared using cosine-similarity to find matching passages for a given query.
-
-For training, we use MultipleNegativesRankingLoss. There, we pass triplets in the format:
-(query, positive_passage, negative_passage)
-
-Negative passage are hard negative examples, that were mined using different dense embedding methods and lexical search methods.
-Each positive and negative passage comes with a score from a Cross-Encoder. This allows denoising, i.e. removing false negative
-passages that are actually relevant for the query.
-
-With a distilbert-base-uncased model, it should achieve a performance of about 33.79 MRR@10 on the MSMARCO Passages Dev-Corpus
-
-Running this script:
-python train_bi-encoder-v3.py
-"""
-
-import argparse
-import gzip
-import json
-import logging
-import os
-import pickle
-import random
-import tarfile
+#1) 引入套件
+import random, numpy as np, torch
+seed = 42
+random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+import argparse, json, logging, os
 from datetime import datetime
+from typing import List
 
-import tqdm
-from torch.utils.data import DataLoader, Dataset
-
-from sentence_transformers import InputExample, LoggingHandler, SentenceTransformer, losses, models, util
-
-#### Just some code to print debug information to stdout
+from sentence_transformers import LoggingHandler, SentenceTransformer, models
+from sentence_transformers.losses import MultipleNegativesRankingLoss
+from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
+from datasets import Dataset
+# ---- logging ----
 logging.basicConfig(
-    format="%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO, handlers=[LoggingHandler()]
+    format="%(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    handlers=[LoggingHandler()]
 )
-#### /print debug information to stdout
 
 
+#2) 解析參數
 parser = argparse.ArgumentParser()
-parser.add_argument("--train_batch_size", default=64, type=int)
+parser.add_argument("--model_name", default="intfloat/multilingual-e5-small")
+parser.add_argument("--train_batch_size", default=192, type=int)
 parser.add_argument("--max_seq_length", default=300, type=int)
-parser.add_argument("--model_name", required=True)
-parser.add_argument("--max_passages", default=0, type=int)
 parser.add_argument("--epochs", default=10, type=int)
-parser.add_argument("--pooling", default="mean")
-parser.add_argument(
-    "--negs_to_use",
-    default=None,
-    help="From which systems should negatives be used? Multiple systems separated by comma. None = all",
-)
-parser.add_argument("--warmup_steps", default=1000, type=int)
+parser.add_argument("--warmup_ratio", default=0.1, type=float)
 parser.add_argument("--lr", default=2e-5, type=float)
-parser.add_argument("--num_negs_per_system", default=5, type=int)
-parser.add_argument("--use_pre_trained_model", default=False, action="store_true")
-parser.add_argument("--use_all_queries", default=False, action="store_true")
-parser.add_argument("--ce_score_margin", default=3.0, type=float)
-args = parser.parse_args()
+parser.add_argument("--data_dir", default="data")
+cli = parser.parse_args()
+print(cli)
 
-print(args)
+# ---- model ----
 
-# The  model we want to fine-tune
-model_name = args.model_name
+# 3)載入嵌入模型
+word_embedding_model = models.Transformer(cli.model_name, max_seq_length=cli.max_seq_length)
+pooling_model = models.Pooling(
+    word_embedding_model.get_word_embedding_dimension(),
+    pooling_mode_mean_tokens=True,
+    normalize_embeddings=True,  # E5 需要 L2 normalize
+)
+model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
 
-train_batch_size = (
-    args.train_batch_size
-)  # Increasing the train batch size improves the model performance, but requires more GPU memory
-max_seq_length = args.max_seq_length  # Max length for passages. Increasing it, requires more GPU memory
-ce_score_margin = args.ce_score_margin  # Margin for the CrossEncoder score between negative and positive passages
-num_negs_per_system = (
-    args.num_negs_per_system
-)  # We used different systems to mine hard negatives. Number of hard negatives to add from each system
-num_epochs = args.epochs  # Number of epochs we want to train
 
-# Load our embedding model
-if args.use_pre_trained_model:
-    logging.info("use pretrained SBERT model")
-    model = SentenceTransformer(model_name)
-    model.max_seq_length = max_seq_length
+
+# 4)讀取資料
+# === V3-REWRITE [Data I/O] START ===
+
+# 讀取 corpus.txt，建立 id->text 的對照表
+corpus_path = os.path.join(cli.data_dir, "corpus.txt")
+corpus = {}
+with open(corpus_path, "r", encoding="utf-8") as f:
+    for line in f:
+        item = json.loads(line)
+        corpus[item["id"]] = item["text"]
+
+logging.info(f"讀取 corpus 完成，共 {len(corpus)} 篇文章")
+
+# 讀取 train.txt，暫存整份資料
+train_path  = os.path.join(cli.data_dir, "train.txt")
+train_jsonl = []
+with open(train_path, "r", encoding="utf-8") as f:
+    for line in f:
+        train_jsonl.append(json.loads(line))
+
+logging.info(f"讀取 train.txt 完成，共 {len(train_jsonl)} 筆訓練資料")
+# === V3-REWRITE [Data I/O] END ===
+
+# 5)建立訓練資料 rows
+# === V3-REWRITE [Build rows from train.txt] START ===
+
+def resolve_evidence_to_text(ev: str, corpus_by_id: dict) -> str:
+    """
+    將 evidence 轉成 passage 文字：
+    - 若 ev 剛好是 corpus 的鍵（如 "25749059@5"），就用 corpus 文本。
+    - 否則視為已是原文段落（直接回傳）。
+    """
+    if ev in corpus_by_id:
+        return corpus_by_id[ev]
+    return ev  # 多數 HW3 的 evidences 本來就放段落全文
+
+def collect_positive_passages(sample: dict, corpus_by_id: dict) -> List[str]:
+    """
+    從一筆 train 樣本中，收集所有 retrieval_labels==1 的正例段落文字。
+    允許多正例；之後可選擇「只取一篇」或「展開成多筆 rows」。
+    """
+    positives = []
+    for ev, lab in zip(sample.get("evidences", []), sample.get("retrieval_labels", [])):
+        if lab == 1:
+            positives.append(resolve_evidence_to_text(ev, corpus_by_id))
+    # 去重（有時候同一段落重複塞進 evidences）
+    # 也順便 strip
+    dedup = []
+    seen = set()
+    for p in positives:
+        t = p.strip()
+        if t and t not in seen:
+            dedup.append(t)
+            seen.add(t)
+    return dedup
+
+rows = []
+num_queries_total = 0
+num_queries_with_pos = 0
+num_rows_generated = 0
+
+for sample in train_jsonl:
+    num_queries_total += 1
+
+    # 1) 取 query（E5 前綴）
+    #    若你想改用 sample["question"] 也可，但一般建議用 rewrite（較像使用者實際查詢）
+    q_raw = (sample.get("rewrite") or sample.get("question") or "").strip()
+    if not q_raw:
+        # 沒 query 就跳過
+        continue
+    q = "query: " + q_raw
+
+    # 2) 收集所有正例段落（文字）
+    positives = collect_positive_passages(sample, corpus)
+    if not positives:
+        continue
+
+    num_queries_with_pos += 1
+
+    # 3) 產 row 策略：
+    #    A) 「每個 query 只取一篇正例」——訓練穩定、資料均衡（建議 baseline）
+    #    B) 「展開成多筆」——對每個正例各產一筆 row（資料較多，但要注意 query 分布）
+    # 先採 A 策略：只取第一篇正例
+    p = positives[0]
+    rows.append({"texts": [q, "passage: " + p]})
+    num_rows_generated += 1
+
+    # 若想改用 B 策略，改成以下展開（註解掉 A）：
+    # for p in positives:
+    #     rows.append({"texts": [q, "passage: " + p]})
+    #     num_rows_generated += 1
+
+logging.info(
+    f"[Build rows] 總樣本: {num_queries_total}；有正例的 query: {num_queries_with_pos}；產生 rows: {num_rows_generated}"
+)
+
+# 4) 檢查 rows 內容，避免空資料繼續往下
+if len(rows) == 0:
+    raise RuntimeError("[Build rows] 產生的 rows 為 0，請檢查 train.txt / corpus.txt 讀取或標記")
+
+# === V3-REWRITE [Build rows from train.txt] END ===
+
+# 6) 建立 Dataset
+# === V3-REWRITE [Step 6 Dataset] START ===
+
+# rows 來自第⑤步，格式為：
+# rows = [{"texts": ["query: ...", "passage: ..."]}, ...]
+
+# 建立 Dataset
+train_ds_all = Dataset.from_list(rows)
+splits = train_ds_all.train_test_split(test_size=0.10, seed=42)  # 9:1
+train_ds = splits["train"]
+valid_ds = splits["test"]
+logging.info(f"[Step 6] Split sizes => train={len(train_ds)} | valid={len(valid_ds)}")
+# === V3-REWRITE [Step 6 Dataset] END ===
+
+
+
+# 訓練 SentenceTransformer 模型需 dataset、dataloader 及 loss
+#7) Trainer 設定與啟動
+# === V3-REWRITE [Step 7 DataLoader] START ===
+from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
+from sentence_transformers.losses import MultipleNegativesRankingLoss
+
+train_args = SentenceTransformerTrainingArguments(
+    output_dir="./models/retriever",
+    num_train_epochs=cli.epochs,
+    per_device_train_batch_size=cli.train_batch_size,
+    learning_rate=cli.lr,
+    warmup_ratio=cli.warmup_ratio,
+    save_strategy="epoch",            # 每 epoch 存檔
+    evaluation_strategy="epoch",      # 每 epoch 評估
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+    save_total_limit=3,
+    logging_strategy="steps",
+    logging_steps=200,
+    bf16=True,                        # A100 友善
+    fp16=False,
+    seed = 42,                   # 設定隨機種子以確保可重現性
+    dataloader_num_workers=2, # 設定 DataLoader 的工作緒數
+)
+
+loss = MultipleNegativesRankingLoss(model)
+trainer = SentenceTransformerTrainer(
+    model=model,
+    args=train_args,
+    train_dataset=train_ds,
+    eval_dataset=valid_ds,
+    loss=loss,
+)
+trainer.train()
+
+# 儲存最佳模型（train_args 指到最佳 checkpoint）
+model.save_pretrained("./models/retriever")
+# === V3-REWRITE [Step 7 DataLoader] END ===
+
+
+#8) 繪製 loss curve 並儲存模型
+import matplotlib.pyplot as plt
+
+state_path = os.path.join(train_args.output_dir, "trainer_state.json")
+if os.path.exists(state_path):
+    with open(state_path, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    logs = state.get("log_history", [])
+
+    steps_t, loss_t = [], []
+    steps_e, loss_e = [], []
+    for log in logs:
+        if "loss" in log:
+            steps_t.append(log.get("step", None))
+            loss_t.append(log["loss"])
+        if "eval_loss" in log:
+            steps_e.append(log.get("step", None))
+            loss_e.append(log["eval_loss"])
+
+    plt.figure()
+    if loss_t:
+        plt.plot(steps_t, loss_t, label="train_loss")
+    if loss_e:
+        plt.plot(steps_e, loss_e, label="eval_loss")
+    plt.xlabel("steps"); plt.ylabel("loss"); plt.title("Fine-tuning Loss")
+    plt.legend(); plt.tight_layout()
+    os.makedirs(train_args.output_dir, exist_ok=True)
+    plt.savefig(os.path.join(train_args.output_dir, "loss_curve.png"))
 else:
-    logging.info("Create new SBERT model")
-    word_embedding_model = models.Transformer(model_name, max_seq_length=max_seq_length)
-    pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), args.pooling)
-    model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
-
-model_save_path = "output/train_bi-encoder-mnrl-{}-margin_{:.1f}-{}".format(
-    model_name.replace("/", "-"), ce_score_margin, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-)
-
-
-### Now we read the MS Marco dataset
-data_folder = "msmarco-data"
-
-#### Read the corpus files, that contain all the passages. Store them in the corpus dict
-corpus = {}  # dict in the format: passage_id -> passage. Stores all existent passages
-collection_filepath = os.path.join(data_folder, "collection.tsv")
-if not os.path.exists(collection_filepath):
-    tar_filepath = os.path.join(data_folder, "collection.tar.gz")
-    if not os.path.exists(tar_filepath):
-        logging.info("Download collection.tar.gz")
-        util.http_get("https://msmarco.z22.web.core.windows.net/msmarcoranking/collection.tar.gz", tar_filepath)
-
-    with tarfile.open(tar_filepath, "r:gz") as tar:
-        tar.extractall(path=data_folder)
-
-logging.info("Read corpus: collection.tsv")
-with open(collection_filepath, encoding="utf8") as fIn:
-    for line in fIn:
-        pid, passage = line.strip().split("\t")
-        pid = int(pid)
-        corpus[pid] = passage
-
-
-### Read the train queries, store in queries dict
-queries = {}  # dict in the format: query_id -> query. Stores all training queries
-queries_filepath = os.path.join(data_folder, "queries.train.tsv")
-if not os.path.exists(queries_filepath):
-    tar_filepath = os.path.join(data_folder, "queries.tar.gz")
-    if not os.path.exists(tar_filepath):
-        logging.info("Download queries.tar.gz")
-        util.http_get("https://msmarco.z22.web.core.windows.net/msmarcoranking/queries.tar.gz", tar_filepath)
-
-    with tarfile.open(tar_filepath, "r:gz") as tar:
-        tar.extractall(path=data_folder)
-
-
-with open(queries_filepath, encoding="utf8") as fIn:
-    for line in fIn:
-        qid, query = line.strip().split("\t")
-        qid = int(qid)
-        queries[qid] = query
-
-
-# Load a dict (qid, pid) -> ce_score that maps query-ids (qid) and paragraph-ids (pid)
-# to the CrossEncoder score computed by the cross-encoder/ms-marco-MiniLM-L6-v2 model
-ce_scores_file = os.path.join(data_folder, "cross-encoder-ms-marco-MiniLM-L6-v2-scores.pkl.gz")
-if not os.path.exists(ce_scores_file):
-    logging.info("Download cross-encoder scores file")
-    util.http_get(
-        "https://huggingface.co/datasets/sentence-transformers/msmarco-hard-negatives/resolve/main/cross-encoder-ms-marco-MiniLM-L-6-v2-scores.pkl.gz",
-        ce_scores_file,
-    )
-
-logging.info("Load CrossEncoder scores dict")
-with gzip.open(ce_scores_file, "rb") as fIn:
-    ce_scores = pickle.load(fIn)
-
-# As training data we use hard-negatives that have been mined using various systems
-hard_negatives_filepath = os.path.join(data_folder, "msmarco-hard-negatives.jsonl.gz")
-if not os.path.exists(hard_negatives_filepath):
-    logging.info("Download cross-encoder scores file")
-    util.http_get(
-        "https://huggingface.co/datasets/sentence-transformers/msmarco-hard-negatives/resolve/main/msmarco-hard-negatives.jsonl.gz",
-        hard_negatives_filepath,
-    )
-
-
-logging.info("Read hard negatives train file")
-train_queries = {}
-negs_to_use = None
-with gzip.open(hard_negatives_filepath, "rt") as fIn:
-    for line in tqdm.tqdm(fIn):
-        data = json.loads(line)
-
-        # Get the positive passage ids
-        qid = data["qid"]
-        pos_pids = data["pos"]
-
-        if len(pos_pids) == 0:  # Skip entries without positives passages
-            continue
-
-        pos_min_ce_score = min([ce_scores[qid][pid] for pid in data["pos"]])
-        ce_score_threshold = pos_min_ce_score - ce_score_margin
-
-        # Get the hard negatives
-        neg_pids = set()
-        if negs_to_use is None:
-            if args.negs_to_use is not None:  # Use specific system for negatives
-                negs_to_use = args.negs_to_use.split(",")
-            else:  # Use all systems
-                negs_to_use = list(data["neg"].keys())
-            logging.info("Using negatives from the following systems: {}".format(", ".join(negs_to_use)))
-
-        for system_name in negs_to_use:
-            if system_name not in data["neg"]:
-                continue
-
-            system_negs = data["neg"][system_name]
-            negs_added = 0
-            for pid in system_negs:
-                if ce_scores[qid][pid] > ce_score_threshold:
-                    continue
-
-                if pid not in neg_pids:
-                    neg_pids.add(pid)
-                    negs_added += 1
-                    if negs_added >= num_negs_per_system:
-                        break
-
-        if args.use_all_queries or (len(pos_pids) > 0 and len(neg_pids) > 0):
-            train_queries[data["qid"]] = {
-                "qid": data["qid"],
-                "query": queries[data["qid"]],
-                "pos": pos_pids,
-                "neg": neg_pids,
-            }
-
-del ce_scores
-
-logging.info(f"Train queries: {len(train_queries)}")
-
-
-# We create a custom MSMARCO dataset that returns triplets (query, positive, negative)
-# on-the-fly based on the information from the mined-hard-negatives jsonl file.
-class MSMARCODataset(Dataset):
-    def __init__(self, queries, corpus):
-        self.queries = queries
-        self.queries_ids = list(queries.keys())
-        self.corpus = corpus
-
-        for qid in self.queries:
-            self.queries[qid]["pos"] = list(self.queries[qid]["pos"])
-            self.queries[qid]["neg"] = list(self.queries[qid]["neg"])
-            random.shuffle(self.queries[qid]["neg"])
-
-    def __getitem__(self, item):
-        query = self.queries[self.queries_ids[item]]
-        query_text = query["query"]
-
-        pos_id = query["pos"].pop(0)  # Pop positive and add at end
-        pos_text = self.corpus[pos_id]
-        query["pos"].append(pos_id)
-
-        neg_id = query["neg"].pop(0)  # Pop negative and add at end
-        neg_text = self.corpus[neg_id]
-        query["neg"].append(neg_id)
-
-        return InputExample(texts=[query_text, pos_text, neg_text])
-
-    def __len__(self):
-        return len(self.queries)
-
-
-# For training the SentenceTransformer model, we need a dataset, a dataloader, and a loss used for training.
-train_dataset = MSMARCODataset(train_queries, corpus=corpus)
-train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=train_batch_size)
-train_loss = losses.MultipleNegativesRankingLoss(model=model)
-
-# Train the model
-model.fit(
-    train_objectives=[(train_dataloader, train_loss)],
-    epochs=num_epochs,
-    warmup_steps=args.warmup_steps,
-    use_amp=True,
-    checkpoint_path=model_save_path,
-    checkpoint_save_steps=len(train_dataloader),
-    optimizer_params={"lr": args.lr},
-)
-
-# Save the model
-model.save(model_save_path)
+    logging.warning("trainer_state.json not found; skip plotting.")
