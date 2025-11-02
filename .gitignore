@@ -1,0 +1,18 @@
+# 虛擬環境
+venv/
+__pycache__/
+*.pyc
+
+# 系統與暫存檔
+.DS_Store
+*.log
+*.swp
+
+# 模型或資料
+*.pt
+*.bin
+*.ckpt
+*.model
+*.pkl
+data/
+models/
