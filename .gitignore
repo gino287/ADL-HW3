@@ -16,3 +16,4 @@ __pycache__/
 *.pkl
 data/
 models/
+vector_database/

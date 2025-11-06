@@ -46,9 +46,9 @@ TOP_K = 10
 TOP_M = 3 # top M passages send to LLM
 GEN_MAXLEN = 1280
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_Q = 16 # you can adjust this value to fit hardware constraints
-BATCH_GEN = 2 # you can adjust this value to fit hardware constraints
-TEST_DATA_SIZE = -1  # set to -1 to run on the whole test set 
+BATCH_Q = 512 # you can adjust this value to fit hardware constraints
+BATCH_GEN = 8 # you can adjust this value to fit hardware constraints
+TEST_DATA_SIZE = 100  # set to -1 to run on the whole test set 
 
 ###############################################################################
 # 1. load db and index
